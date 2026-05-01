@@ -1,0 +1,11 @@
+services:
+  rocketmq-client:
+    build: .
+    container_name: rmq-client-container
+    environment:
+      - TZ=Europe/Berlin
+      - RMQ_ENDPOINT=${RMQ_ENDPOINT}
+      - RMQ_TOPIC=${RMQ_TOPIC}
+      - RMQ_GROUP=${RMQ_GROUP}
+      - RMQ_ACCESS_KEY=${RMQ_ACCESS_KEY}
+      - RMQ_SECRET_KEY=${RMQ_SECRET_KEY}
