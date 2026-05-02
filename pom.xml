@@ -12,16 +12,29 @@
     </properties>
 
     <dependencies>
+        <!-- RocketMQ Core -->
         <dependency>
             <groupId>org.apache.rocketmq</groupId>
             <artifactId>rocketmq-client</artifactId>
             <version>4.9.4</version>
         </dependency>
-        <!-- Authentication requires the ACL module -->
+        <!-- RocketMQ ACL (Wichtig für die Authentifizierung) -->
         <dependency>
             <groupId>org.apache.rocketmq</groupId>
             <artifactId>rocketmq-acl</artifactId>
             <version>4.9.4</version>
+        </dependency>
+        <!-- MQTT Bibliothek (Das hat gefehlt!) -->
+        <dependency>
+            <groupId>org.eclipse.paho</groupId>
+            <artifactId>org.eclipse.paho.client.mqttv3</artifactId>
+            <version>1.2.5</version>
+        </dependency>
+        <!-- JSON Parser -->
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
+            <version>1.2.83</version>
         </dependency>
     </dependencies>
 

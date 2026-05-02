@@ -9,3 +9,6 @@ services:
       - RMQ_GROUP=${RMQ_GROUP}
       - RMQ_ACCESS_KEY=${RMQ_ACCESS_KEY}
       - RMQ_SECRET_KEY=${RMQ_SECRET_KEY}
+      - MQTT_URL=${MQTT_URL}
+      - MQTT_USER=${MQTT_USER}
+      - MQTT_PASS=${MQTT_PASS}
