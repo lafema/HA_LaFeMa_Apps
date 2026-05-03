@@ -1,4 +1,4 @@
-# Lafema Home Assistant App Repository
+# LaFeMa Home Assistant App Repository
 
 This repository contains custom apps for Home Assistant.
 
@@ -11,7 +11,7 @@ To add these apps to your Home Assistant instance:
 3. Click the three-dot menu (⋮) in the top right and select **Repositories**.
 4. Add the following URL:
    `https://github.com/lafema/HA_LaFeMa_Apps`
-5. Once added, you can find and install the apps directly from the store under the category **Lafema Apps**.
+5. Once added, you can find and install the apps directly from the store under the category **LaFeMa's Home Assistant Apps**.
 
 ## Available Apps
 
