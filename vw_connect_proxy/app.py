@@ -1,4 +1,5 @@
 import asyncio
+import glob
 import json
 import logging
 import os
@@ -64,45 +65,11 @@ async def start_webserver():
     await site.start()
     logging.info("Webserver für HA Ingress auf Port 8099 gestartet.")
 
-# --- PLAYWRIGHT AUTOMATISIERUNG ---
-async def intercept_tokens(response):
-    """Fängt API-Responses ab und validiert sie gegen die HACS-Anforderungen."""
-    global vw_tokens
-    
-    if response.status == 200 and "application/json" in response.headers.get("content-type", ""):
-        try:
-            data = await response.json()
-            
-            # Wir prüfen strikt auf die Vorgaben aus vw_connection.py (Zeile 283)
-            if "access_token" in data and "id_token" in data:
-                
-                # Wir bauen exakt die Struktur nach, die die Bibliothek erwartet
-                vw_tokens = {
-                    "access_token": data.get("access_token"),
-                    "id_token": data.get("id_token"),
-                    "refresh_token": data.get("refresh_token"),
-                    "token_type": data.get("token_type", "Bearer")
-                }
-                
-                logging.info(f"BINGO! Validiertes Token-Paket von {response.url} abgefangen.")
-                
-                # Wenn du das Add-on nutzt, müssen wir prüfen, wo genau die 
-                # HACS Integration diese Datei auf dem Dateisystem erwartet.
-                with open(TOKEN_FILE, 'w') as f:
-                    json.dump(vw_tokens, f, indent=4)
-                logging.info(f"Tokens erfolgreich im Format der vw_connection.py in {TOKEN_FILE} gespeichert.")
-                
-        except Exception:
-            pass
-
 async def run_browser_automation():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--disable-dev-shm-usage', '--no-sandbox'])
         context = await browser.new_context()
         page = await context.new_page()
-        
-        # Netzwerk-Traffic abhören, um Tokens abzufangen
-        page.on("response", intercept_tokens)
 
         try:
             logging.info("Navigiere zur VW-Anmeldeseite...")
@@ -158,13 +125,34 @@ async def run_browser_automation():
             
                 await page.wait_for_url("**/*featureAppSection*", timeout=30000)
                 logging.info("Dashboard erfolgreich erreicht! Login abgeschlossen.")
+
+                # Cookie-Datei der HACS-Integration dynamisch suchen
+                storage_dir = "/config/.storage"
+
+                # Sucht nach der Datei mit dem Hash im Namen
+                cookie_files = glob.glob(os.path.join(storage_dir, "volkswagencarnet_auth_*.json"))
                 
-                # Kurz warten, damit die Token-Requests im Hintergrund sicher durchlaufen
-                await asyncio.sleep(10)
-
+                if cookie_files:
+                    original_file = cookie_files[0]
+                    directory, filename = os.path.split(original_file)
+                    
+                    # "test_" Präfix hinzufügen
+                    test_cookie_file = os.path.join(directory, f"test_{filename}")
+                    logging.info(f"Speichere Test-Cookies in: {test_cookie_file}")
+                    
+                    # Alle Session-Cookies aus Playwright ziehen
+                    cookies = await context.cookies()
+                    
+                    # Cookies in die Test-Datei schreiben
+                    with open(test_cookie_file, 'w') as f:
+                        json.dump(cookies, f, indent=4)
+                        
+                    logging.info("Playwright-Cookies erfolgreich an die HACS-Integration übergeben.")
+                else:
+                    logging.error("FEHLER: Keine volkswagencarnet_auth_*.json in /config/.storage/ gefunden!")
                 
-
-
+                # Kurz warten
+                await asyncio.sleep(5)
                 
             except Exception as e:
                 logging.warning("Timeout beim Warten auf '/portal/'. Erstelle Debug-Screenshot...")
