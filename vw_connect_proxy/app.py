@@ -66,19 +66,34 @@ async def start_webserver():
 
 # --- PLAYWRIGHT AUTOMATISIERUNG ---
 async def intercept_tokens(response):
-    """Fängt API-Responses von VW ab und speichert die Tokens."""
+    """Fängt API-Responses ab und validiert sie gegen die HACS-Anforderungen."""
     global vw_tokens
-    if "identity.vwgroup.io/oidc/v1/token" in response.url and response.status == 200:
+    
+    if response.status == 200 and "application/json" in response.headers.get("content-type", ""):
         try:
             data = await response.json()
-            if "access_token" in data:
-                vw_tokens = data
-                logging.info("BINGO! Access Token und Refresh Token erfolgreich abgefangen.")
+            
+            # Wir prüfen strikt auf die Vorgaben aus vw_connection.py (Zeile 283)
+            if "access_token" in data and "id_token" in data:
+                
+                # Wir bauen exakt die Struktur nach, die die Bibliothek erwartet
+                vw_tokens = {
+                    "access_token": data.get("access_token"),
+                    "id_token": data.get("id_token"),
+                    "refresh_token": data.get("refresh_token"),
+                    "token_type": data.get("token_type", "Bearer")
+                }
+                
+                logging.info(f"BINGO! Validiertes Token-Paket von {response.url} abgefangen.")
+                
+                # Wenn du das Add-on nutzt, müssen wir prüfen, wo genau die 
+                # HACS Integration diese Datei auf dem Dateisystem erwartet.
                 with open(TOKEN_FILE, 'w') as f:
-                    json.dump(vw_tokens, f)
-                logging.info(f"Tokens für die HACS-Integration unter {TOKEN_FILE} gespeichert.")
-        except Exception as e:
-            logging.error(f"Fehler beim Auslesen des Tokens: {e}")
+                    json.dump(vw_tokens, f, indent=4)
+                logging.info(f"Tokens erfolgreich im Format der vw_connection.py in {TOKEN_FILE} gespeichert.")
+                
+        except Exception:
+            pass
 
 async def run_browser_automation():
     async with async_playwright() as p:
@@ -140,11 +155,16 @@ async def run_browser_automation():
             # Auf Weiterleitung warten und bei Timeout einen Screenshot machen
             try:
                 logging.info("Warte auf finale Weiterleitung ins Portal...")
-                await page.wait_for_url("**/portal/**", timeout=30000) 
-                logging.info("Login erfolgreich abgeschlossen! Browser wird in 10 Sekunden geschlossen.")
+            
+                await page.wait_for_url("**/*featureAppSection*", timeout=30000)
+                logging.info("Dashboard erfolgreich erreicht! Login abgeschlossen.")
                 
                 # Kurz warten, damit die Token-Requests im Hintergrund sicher durchlaufen
                 await asyncio.sleep(10)
+
+                
+
+
                 
             except Exception as e:
                 logging.warning("Timeout beim Warten auf '/portal/'. Erstelle Debug-Screenshot...")
