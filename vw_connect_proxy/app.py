@@ -119,10 +119,18 @@ async def run_browser_automation():
                     code_received_event.clear()
                     await asyncio.wait_for(code_received_event.wait(), timeout=300) # 5 Minuten Timeout
                     
+                    # Code eingeben
                     logging.info(f"Gebe empfangenen Code ein: {vw_2fa_code}")
                     await page.fill('input[name="code"]', vw_2fa_code)
-                    await page.check('input#rememberBrowser')
-                    await page.click('button[type="submit"][name="action"]')
+                    
+                    # Checkbox anklicken (30 Tage speichern)
+                    logging.info("Setze Haken bei 'Dieses Gerät 30 Tage speichern'...")
+                    await page.locator('label[for="rememberBrowser"]').click()
+                    
+                    # Button zum Fortfahren klicken
+                    logging.info("Klicke auf Fortfahren...")
+                    await page.locator('button[data-action-button-primary="true"]').click()
+
             except asyncio.TimeoutError:
                 logging.error("Kein Code über die Web-UI eingegangen (Timeout nach 5 Minuten).")
                 return
