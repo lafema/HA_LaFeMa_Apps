@@ -73,7 +73,7 @@ async def run_browser_automation():
 
         try:
             logging.info("Navigiere zur VW-Anmeldeseite...")
-            await page.goto("https://www.volkswagen.de/de/besitzer-und-nutzer/myvolkswagen.html", timeout=60000)
+            await page.goto("https://identity.vwgroup.io/v2/login/ui/sign-up?client_id=@apps_vw-dilab_com&lee=VOLKSWAGEN&theme=volkswagen", timeout=60000)
 
             # Cookie Banner
             try:
