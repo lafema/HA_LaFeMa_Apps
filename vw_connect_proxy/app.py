@@ -129,12 +129,28 @@ async def run_browser_automation():
             except Exception:
                 pass # Keine 2FA Maske, normal weiter
 
-            # Auf Portal-Weiterleitung warten
-            await page.wait_for_url("**/portal/**", timeout=30000) 
-            logging.info("Login erfolgreich abgeschlossen! Browser wird in 10 Sekunden geschlossen.")
-            
-            # Kurz warten, damit die Token-Requests im Hintergrund sicher durchlaufen
-            await asyncio.sleep(10)
+            # Auf Weiterleitung warten und bei Timeout einen Screenshot machen
+            try:
+                logging.info("Warte auf finale Weiterleitung ins Portal...")
+                await page.wait_for_url("**/portal/**", timeout=30000) 
+                logging.info("Login erfolgreich abgeschlossen! Browser wird in 10 Sekunden geschlossen.")
+                
+                # Kurz warten, damit die Token-Requests im Hintergrund sicher durchlaufen
+                await asyncio.sleep(10)
+                
+            except Exception as e:
+                logging.warning("Timeout beim Warten auf '/portal/'. Erstelle Debug-Screenshot...")
+                
+                # Aktuelle URL ins Log schreiben (oft verrät das schon das Problem)
+                logging.info(f"Die aktuelle URL im Browser ist: {page.url}")
+                
+                # Screenshot im Home Assistant config-Ordner speichern
+                debug_path = "/config/vw_login_timeout.png"
+                await page.screenshot(path=debug_path)
+                logging.info(f"Screenshot erfolgreich unter {debug_path} gespeichert!")
+                
+                # Wir lassen ihn trotzdem noch kurz warten, falls noch Netzwerk-Requests für die Tokens laufen
+                await asyncio.sleep(10)
 
         except Exception as e:
             logging.error(f"Fehler: {e}")
