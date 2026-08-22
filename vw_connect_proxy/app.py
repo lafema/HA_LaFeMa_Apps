@@ -124,7 +124,10 @@ async def run_browser_automation():
             logging.info("Starte nativen App-Login-Flow...")
             await page.goto(auth_url, timeout=60000)
 
-            await page.screenshot(path="/config/vw_login_001.png")
+            # Screenshot im Home Assistant config-Ordner speichern
+            debug_path = "/config/vw_login_001.png"
+            await page.screenshot(path=debug_path)
+            logging.info(f"Screenshot erfolgreich unter {debug_path} gespeichert!")
 
             # Cookie Banner
             try:
