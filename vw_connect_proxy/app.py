@@ -82,29 +82,28 @@ async def start_webserver():
     await site.start()
     logging.info("Webserver für HA Ingress auf Port 8099 gestartet.")
 
-# --- PLAYWRIGHT ROUTE INTERCEPTOR ---
-async def intercept_weconnect_redirect(route):
-    """Fängt die weconnect:// Weiterleitung ab und extrahiert den Auth Code."""
+# --- PLAYWRIGHT EVENT LISTENER ---
+async def handle_request(request):
+    """Lauscht passiv auf alle Anfragen und fängt den weconnect-Redirect ab."""
     global auth_code
-    url = route.request.url
+    url = request.url
+    
+    # Sobald Chromium versucht, den App-Link zu öffnen, schlagen wir zu
     if url.startswith("weconnect://"):
-        logging.info(f"App-Redirect abgefangen: {url}")
+        logging.info(f"App-Redirect erfolgreich gesichtet: {url}")
         parsed_url = urllib.parse.urlparse(url)
         query_params = urllib.parse.parse_qs(parsed_url.query)
         
-        # Manchmal hängt der Code auch im Fragment
+        # Falls der Code im Fragment steht (VW ändert das manchmal)
         if not query_params and parsed_url.fragment:
             query_params = urllib.parse.parse_qs(parsed_url.fragment)
             
         code = query_params.get("code", [None])[0]
         if code:
-            logging.info("Authorization Code erfolgreich abgefangen!")
+            logging.info("Authorization Code erfolgreich aus der URL extrahiert!")
             auth_code = code
+            # Signal an das Hauptskript senden, dass wir fertig sind
             auth_flow_finished_event.set()
-            
-        await route.abort()
-    else:
-        await route.continue_()
 
 # --- PLAYWRIGHT AUTOMATION ---
 async def run_browser_automation():
@@ -113,8 +112,8 @@ async def run_browser_automation():
         context = await browser.new_context()
         page = await context.new_page()
 
-        # Route Interceptor aktivieren
-        await page.route("**/*", intercept_weconnect_redirect)
+        # Wir nutzen jetzt den passiven Event-Listener statt page.route!
+        page.on("request", handle_request)
 
         try:
             # 1. PKCE Parameter generieren
@@ -167,8 +166,11 @@ async def run_browser_automation():
             # Prüfen, ob das Passwort-Feld schon sichtbar ist
             if not await page.locator('input[type="password"]').is_visible():
                 logging.info("Passwort-Feld nicht direkt sichtbar, klicke auf Weiter...")
-                # Suchen nach Text, der auf den Weiter-Button passt
-                await page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first.click()
+                # Suchen nach Text, der auf den Weiter-Button passt, klick fehlertolerant verpacken
+                try:
+                    await page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first.click(timeout=3000)
+                except Exception:
+                    pass
                 await page.locator('input[type="password"]').wait_for(timeout=5000)
 
             # Passwort
@@ -181,8 +183,12 @@ async def run_browser_automation():
             
             # Formular explizit über den Text-Button absenden
             logging.info("Sende Login-Formular ab...")
-            submit_btn = page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first
-            await submit_btn.click()
+            try:
+                submit_btn = page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first
+                # Wir fangen Fehler beim Klick ab, da die Seite sofort navigieren und den Kontext zerstören kann
+                await submit_btn.click(timeout=5000)
+            except Exception as e:
+                logging.debug(f"Erwarteter Klick-Abbruch (Navigation hat gestartet): {e}")
             
             # Dem Server Zeit zum Verarbeiten geben
             await asyncio.sleep(4)
@@ -208,7 +214,10 @@ async def run_browser_automation():
                     except Exception:
                         pass
                     
-                    await page.locator('button[data-action-button-primary="true"]').click()
+                    try:
+                        await page.locator('button[data-action-button-primary="true"]').click()
+                    except Exception:
+                        pass
                     await asyncio.sleep(4)
             except asyncio.TimeoutError:
                 logging.error("Kein Code über die Web-UI eingegangen (Timeout nach 5 Minuten).")
@@ -226,8 +235,13 @@ async def run_browser_automation():
                 pass
 
             # 3. Warten, bis der Redirect weconnect:// abgefangen wurde
-            logging.info("Warte auf App-Weiterleitung...")
-            await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=45.0)
+            logging.info("Warte auf App-Weiterleitung (Custom Protocol Scheme)...")
+            try:
+                await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=45.0)
+            except asyncio.TimeoutError:
+                logging.error("Timeout! Der Redirect wurde nicht erkannt.")
+                await page.screenshot(path="/config/vw_login_timeout.png")
+                return
 
             # 4. Token-Tausch am OIDC Token-Endpoint über Chromium Context
             if auth_code:
