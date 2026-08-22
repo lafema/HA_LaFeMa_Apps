@@ -134,7 +134,17 @@ async def run_browser_automation():
             auth_url = f"https://identity.vwgroup.io/oidc/v1/authorize?{urllib.parse.urlencode(auth_params)}"
 
             logging.info("Starte Authorization-Code Flow über Playwright...")
-            await page.goto(auth_url, timeout=60000)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await page.goto(auth_url, timeout=60000)
+                    break # Erfolg! Raus aus der Schleife
+                except Exception as e:
+                    if "ERR_NETWORK_CHANGED" in str(e) and attempt < max_retries - 1:
+                        logging.warning(f"Netzwerk-Ruckler erkannt. Versuch {attempt + 2} von {max_retries} in 3 Sekunden...")
+                        await asyncio.sleep(3)
+                    else:
+                        raise # Anderer Fehler oder maximale Versuche erreicht -> Fehler werfen
 
             # Screenshot 001 im Home Assistant config-Ordner speichern
             debug_path = "/config/vw_login_001.png"
