@@ -124,7 +124,7 @@ async def run_browser_automation():
             logging.info("Starte nativen App-Login-Flow...")
             await page.goto(auth_url, timeout=60000)
 
-            await page.screenshot("/config/vw_login_001.png")
+            await page.screenshot(path="/config/vw_login_001.png")
 
             # Cookie Banner
             try:
