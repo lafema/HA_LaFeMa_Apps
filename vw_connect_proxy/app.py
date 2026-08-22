@@ -1,13 +1,9 @@
 import asyncio
-import base64
-import hashlib
 import json
 import logging
 import os
-import secrets
 import urllib.parse
 import uuid
-import aiohttp
 from aiohttp import web
 from playwright.async_api import async_playwright
 
@@ -33,15 +29,6 @@ SCOPE = "openid profile badge cars dealers vin offline_access"
 code_received_event = asyncio.Event()
 auth_flow_finished_event = asyncio.Event()
 vw_2fa_code = ""
-auth_code = ""
-
-# --- PKCE HELPER ---
-def generate_pkce_pair():
-    """Generiert code_verifier und code_challenge für PKCE."""
-    code_verifier = secrets.token_urlsafe(64)
-    hashed = hashlib.sha256(code_verifier.encode('ascii')).digest()
-    code_challenge = base64.urlsafe_b64encode(hashed).decode('ascii').rstrip('=')
-    return code_verifier, code_challenge
 
 # --- AIOHTTP WEBSERVER (INGRESS) ---
 async def handle_get(request):
@@ -83,23 +70,36 @@ async def start_webserver():
 
 # --- PLAYWRIGHT EVENT LISTENER ---
 async def handle_request(request):
-    """Lauscht passiv auf alle Anfragen und fängt den weconnect-Redirect ab."""
-    global auth_code
+    """Lauscht passiv auf alle Anfragen, fängt den Redirect ab und speichert die Tokens."""
+    global auth_flow_finished_event
     url = request.url
     
     if url.startswith("weconnect://"):
-        logging.info(f"App-Redirect erfolgreich gesichtet: {url}")
+        logging.info("App-Redirect erfolgreich gesichtet!")
         parsed_url = urllib.parse.urlparse(url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
         
-        if not query_params and parsed_url.fragment:
-            query_params = urllib.parse.parse_qs(parsed_url.fragment)
+        # Beim Implicit Flow ('code id_token token') landen die Tokens direkt im URL-Fragment (#)
+        params = urllib.parse.parse_qs(parsed_url.fragment)
+        if not params:
+            # Fallback, falls VW sie in die Query packt
+            params = urllib.parse.parse_qs(parsed_url.query)
             
-        code = query_params.get("code", [None])[0]
-        if code:
-            logging.info("Authorization Code erfolgreich aus der URL extrahiert!")
-            auth_code = code
+        if "access_token" in params and "id_token" in params:
+            logging.info("BINGO! Tokens direkt aus der URL extrahiert!")
+            vw_tokens = {
+                "access_token": params["access_token"][0],
+                "id_token": params["id_token"][0],
+                "refresh_token": params.get("refresh_token", [""])[0],
+                "token_type": params.get("token_type", ["Bearer"])[0]
+            }
+            
+            with open(TOKEN_FILE, 'w') as f:
+                json.dump(vw_tokens, f, indent=4)
+                
+            logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
             auth_flow_finished_event.set()
+        else:
+            logging.warning("Redirect erkannt, aber keine Zugangstokens in der URL gefunden!")
 
 # --- PLAYWRIGHT AUTOMATION ---
 async def run_browser_automation():
@@ -111,23 +111,18 @@ async def run_browser_automation():
         page.on("request", handle_request)
 
         try:
-            # 1. PKCE Parameter generieren
-            code_verifier, code_challenge = generate_pkce_pair()
+            # Reinen Hybrid Flow initiieren (wie im ursprünglichen Skript)
             nonce = uuid.uuid4().hex
-            
-            # 2. Reinen Authorization Code Flow initiieren
             auth_params = {
                 "client_id": CLIENT_ID,
                 "redirect_uri": REDIRECT_URI,
-                "response_type": "code",
+                "response_type": "code id_token token",
                 "scope": SCOPE,
-                "code_challenge": code_challenge,
-                "code_challenge_method": "S256",
                 "nonce": nonce
             }
             auth_url = f"https://identity.vwgroup.io/oidc/v1/authorize?{urllib.parse.urlencode(auth_params)}"
 
-            logging.info("Starte Authorization-Code Flow über Playwright...")
+            logging.info("Starte Hybrid-Flow über Playwright...")
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -140,17 +135,15 @@ async def run_browser_automation():
                     else:
                         raise 
 
-            # Screenshot 001 im Home Assistant config-Ordner speichern
+            # Screenshot 001
             debug_path1 = "/config/vw_login_001.png"
             await page.screenshot(path=debug_path1)
-            logging.info(f"Screenshot erfolgreich unter {debug_path1} gespeichert!")
 
             # Cookie Banner
             try:
                 cookie_button = page.locator('button:has-text("Alle akzeptieren"), button#accept-all-btn, button[data-testid="uc-accept-all-button"]')
                 await cookie_button.click(timeout=5000)
-            except Exception:
-                pass
+            except Exception: pass
             await asyncio.sleep(2)
 
             # Zugangsdaten
@@ -161,8 +154,7 @@ async def run_browser_automation():
                 logging.info("Passwort-Feld nicht direkt sichtbar, klicke auf Weiter...")
                 try:
                     await page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first.click(timeout=3000)
-                except Exception:
-                    pass
+                except Exception: pass
                 await page.locator('input[type="password"]').wait_for(timeout=5000)
 
             logging.info("Gebe Passwort ein...")
@@ -176,22 +168,19 @@ async def run_browser_automation():
                 submit_btn = page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first
                 await submit_btn.click(timeout=3000)
             except Exception as e:
-                logging.debug(f"Klick ignoriert (Navigation hat gestartet): {e}")
+                logging.debug(f"Klick ignoriert: {e}")
 
-            # Screenshot 002 fehlertolerant ablegen (falls die Seite sofort weiterleitet)
+            # Screenshot 002 fehlertolerant
             try:
                 debug_path2 = "/config/vw_login_002.png"
                 await page.screenshot(path=debug_path2)
-                logging.info(f"Screenshot erfolgreich unter {debug_path2} gespeichert!")
-            except Exception as e:
-                logging.debug("Screenshot 002 übersprungen (Seite hat bereits weitergeleitet)")
+            except Exception: pass
 
-            logging.info("Prüfe auf direkten Redirect (wie im Inkognito-Test beobachtet)...")
+            logging.info("Prüfe auf direkten Redirect...")
             
-            # Wir warten 10 Sekunden auf den sofortigen App-Redirect
             try:
                 await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=10.0)
-                logging.info("Direkter Redirect erkannt! Überspringe 2FA & Zustimmungs-Screens.")
+                logging.info("Automatisierung abgeschlossen! Tokens sind bereit.")
             except asyncio.TimeoutError:
                 # Kein sofortiger Redirect, prüfe auf 2FA
                 logging.info("Kein sofortiger Redirect. Prüfe auf 2FA-Abfrage...")
@@ -202,7 +191,7 @@ async def run_browser_automation():
                         code_received_event.clear()
                         await asyncio.wait_for(code_received_event.wait(), timeout=300)
                         
-                        logging.info(f"Gebe empfangenen Code ein: {vw_2fa_code}")
+                        logging.info(f"Gebe empfangenen Code ein...")
                         await page.fill('input[name="code"]', vw_2fa_code)
                         
                         try:
@@ -223,49 +212,11 @@ async def run_browser_automation():
                         
                         logging.info("Warte auf finale App-Weiterleitung nach 2FA...")
                         await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=15.0)
+                        logging.info("Automatisierung nach 2FA abgeschlossen!")
                         
                 except Exception as e:
                     logging.warning(f"Abbruch beim Warten auf Redirect: {e}")
                     await page.screenshot(path="/config/vw_login_timeout.png")
-                    return
-
-            # 4. Token-Tausch am OIDC Token-Endpoint über sauberen API-Request
-            if auth_code:
-                logging.info("Warte 3 Sekunden (Auth0 Replikations-Delay der VW-Server abwarten)...")
-                await asyncio.sleep(3)
-                
-                logging.info("Tausche Authorization Code gegen Tokens ein...")
-                
-                # Exakten User-Agent und Session-Cookies aus Playwright übernehmen
-                playwright_ua = await page.evaluate("navigator.userAgent")
-                cookies = await context.cookies()
-                session_cookies = {c['name']: c['value'] for c in cookies}
-                
-                headers = {
-                    "User-Agent": playwright_ua,
-                    "Accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-                }
-                
-                payload = {
-                    "grant_type": "authorization_code",
-                    "client_id": CLIENT_ID,
-                    "code": auth_code,
-                    "redirect_uri": REDIRECT_URI,
-                    "code_verifier": code_verifier
-                }
-                
-                async with aiohttp.ClientSession(cookies=session_cookies) as session:
-                    async with session.post("https://identity.vwgroup.io/oidc/v1/token", data=payload, headers=headers) as token_resp:
-                        if token_resp.status == 200:
-                            token_data = await token_resp.json()
-                            logging.info("BINGO! Tokens erfolgreich erhalten!")
-                            with open(TOKEN_FILE, 'w') as f:
-                                json.dump(token_data, f, indent=4)
-                            logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
-                        else:
-                            logging.error(f"Fehler beim Token-Tausch. HTTP {token_resp.status}: {await token_resp.text()}")
 
         except Exception as e:
             logging.error(f"Fehler im Ablauf: {e}")
