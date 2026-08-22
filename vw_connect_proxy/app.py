@@ -112,7 +112,7 @@ async def run_browser_automation():
         context = await browser.new_context()
         page = await context.new_page()
 
-        # Wir nutzen jetzt den passiven Event-Listener statt page.route!
+        # Wir nutzen den passiven Event-Listener
         page.on("request", handle_request)
 
         try:
@@ -120,7 +120,7 @@ async def run_browser_automation():
             code_verifier, code_challenge = generate_pkce_pair()
             nonce = uuid.uuid4().hex
             
-            # 2. Reinen Authorization Code Flow initiieren (ohne implicit 'token')
+            # 2. Reinen Authorization Code Flow initiieren
             auth_params = {
                 "client_id": CLIENT_ID,
                 "redirect_uri": REDIRECT_URI,
@@ -137,18 +137,13 @@ async def run_browser_automation():
             for attempt in range(max_retries):
                 try:
                     await page.goto(auth_url, timeout=60000)
-                    break # Erfolg! Raus aus der Schleife
+                    break 
                 except Exception as e:
                     if "ERR_NETWORK_CHANGED" in str(e) and attempt < max_retries - 1:
                         logging.warning(f"Netzwerk-Ruckler erkannt. Versuch {attempt + 2} von {max_retries} in 3 Sekunden...")
                         await asyncio.sleep(3)
                     else:
-                        raise # Anderer Fehler oder maximale Versuche erreicht -> Fehler werfen
-
-            # Screenshot 001 im Home Assistant config-Ordner speichern
-            debug_path = "/config/vw_login_001.png"
-            await page.screenshot(path=debug_path)
-            logging.info(f"Screenshot erfolgreich unter {debug_path} gespeichert!")
+                        raise 
 
             # Cookie Banner
             try:
@@ -160,88 +155,73 @@ async def run_browser_automation():
 
             # Zugangsdaten
             logging.info("Gebe E-Mail ein...")
-            # Wir nutzen generische Typen und IDs, die in jedem Auth0-Theme gleich sind
             await page.fill('input[type="email"], input[name="email"], input[name="username"]', VW_USER)
             
-            # Prüfen, ob das Passwort-Feld schon sichtbar ist
             if not await page.locator('input[type="password"]').is_visible():
                 logging.info("Passwort-Feld nicht direkt sichtbar, klicke auf Weiter...")
-                # Suchen nach Text, der auf den Weiter-Button passt, klick fehlertolerant verpacken
                 try:
                     await page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first.click(timeout=3000)
                 except Exception:
                     pass
                 await page.locator('input[type="password"]').wait_for(timeout=5000)
 
-            # Passwort
             logging.info("Gebe Passwort ein...")
             await page.fill('input[type="password"]', VW_PASSWORD)
             
-            # Javascript-Validierung triggern: Fokus vom Passwort-Feld nehmen
             await page.keyboard.press('Tab')
             await asyncio.sleep(1)
             
-            # Formular explizit über den Text-Button absenden
             logging.info("Sende Login-Formular ab...")
             try:
                 submit_btn = page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first
-                # Wir fangen Fehler beim Klick ab, da die Seite sofort navigieren und den Kontext zerstören kann
-                await submit_btn.click(timeout=5000)
+                await submit_btn.click(timeout=3000)
             except Exception as e:
-                logging.debug(f"Erwarteter Klick-Abbruch (Navigation hat gestartet): {e}")
+                logging.debug(f"Klick ignoriert (Navigation hat gestartet): {e}")
+
+            logging.info("Prüfe auf direkten Redirect (wie im Inkognito-Test beobachtet)...")
             
-            # Dem Server Zeit zum Verarbeiten geben
-            await asyncio.sleep(4)
-
-            # Screenshot 002 im Home Assistant config-Ordner speichern
-            debug_path = "/config/vw_login_002.png"
-            await page.screenshot(path=debug_path)
-            logging.info(f"Screenshot erfolgreich unter {debug_path} gespeichert!")
-
-            # Prüfen, ob 2FA verlangt wird
+            # Wir warten 10 Sekunden. Wenn in dieser Zeit der App-Redirect erfolgt, 
+            # überspringen wir den ganzen restlichen UI-Quatsch!
             try:
-                if await page.locator('input[name="code"]').is_visible(timeout=5000):
-                    logging.info("!!! VW verlangt 2FA. Bitte öffne die Web UI des Add-ons in Home Assistant und trage den Code ein !!!")
-                    
-                    code_received_event.clear()
-                    await asyncio.wait_for(code_received_event.wait(), timeout=300)
-                    
-                    logging.info(f"Gebe empfangenen Code ein: {vw_2fa_code}")
-                    await page.fill('input[name="code"]', vw_2fa_code)
-                    
-                    try:
-                        await page.locator('label[for="rememberBrowser"]').click()
-                    except Exception:
-                        pass
-                    
-                    try:
-                        await page.locator('button[data-action-button-primary="true"]').click()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(4)
+                await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=10.0)
+                logging.info("Direkter Redirect erkannt! Überspringe 2FA & Zustimmungs-Screens.")
             except asyncio.TimeoutError:
-                logging.error("Kein Code über die Web-UI eingegangen (Timeout nach 5 Minuten).")
-                return
-            except Exception:
-                pass
-
-            # Finaler Zustimmungsbildschirm ("Zulassen"), falls vorhanden
-            try:
-                allow_btn = page.locator('button[data-action-button-primary="true"], button#allowAccess').first
-                if await allow_btn.is_visible(timeout=5000):
-                    logging.info("Klicke auf 'Zulassen'...")
-                    await allow_btn.click()
-            except Exception:
-                pass
-
-            # 3. Warten, bis der Redirect weconnect:// abgefangen wurde
-            logging.info("Warte auf App-Weiterleitung (Custom Protocol Scheme)...")
-            try:
-                await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=45.0)
-            except asyncio.TimeoutError:
-                logging.error("Timeout! Der Redirect wurde nicht erkannt.")
-                await page.screenshot(path="/config/vw_login_timeout.png")
-                return
+                # Nur wenn nach 10 Sekunden KEIN Redirect kam, schauen wir nach, 
+                # ob eine 2FA-Maske den Prozess blockiert.
+                logging.info("Kein sofortiger Redirect. Prüfe auf 2FA-Abfrage...")
+                try:
+                    if await page.locator('input[name="code"]').is_visible(timeout=3000):
+                        logging.info("!!! VW verlangt 2FA. Bitte öffne die Web UI des Add-ons in Home Assistant !!!")
+                        
+                        code_received_event.clear()
+                        await asyncio.wait_for(code_received_event.wait(), timeout=300)
+                        
+                        logging.info(f"Gebe empfangenen Code ein: {vw_2fa_code}")
+                        await page.fill('input[name="code"]', vw_2fa_code)
+                        
+                        try:
+                            await page.locator('label[for="rememberBrowser"]').click(timeout=2000)
+                        except Exception: pass
+                        
+                        try:
+                            await page.locator('button[data-action-button-primary="true"]').click(timeout=3000)
+                        except Exception: pass
+                        
+                        # Zustimmungs-Screen nach 2FA (falls vorhanden)
+                        try:
+                            allow_btn = page.locator('button[data-action-button-primary="true"], button#allowAccess').first
+                            if await allow_btn.is_visible(timeout=3000):
+                                logging.info("Klicke auf 'Zulassen'...")
+                                await allow_btn.click(timeout=3000)
+                        except Exception: pass
+                        
+                        logging.info("Warte auf finale App-Weiterleitung nach 2FA...")
+                        await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=15.0)
+                        
+                except Exception as e:
+                    logging.warning(f"Abbruch beim Warten auf Redirect: {e}")
+                    await page.screenshot(path="/config/vw_login_timeout.png")
+                    return
 
             # 4. Token-Tausch am OIDC Token-Endpoint über Chromium Context
             if auth_code:
@@ -267,7 +247,7 @@ async def run_browser_automation():
                     logging.error(f"Fehler beim Token-Tausch. HTTP {token_resp.status}: {await token_resp.text()}")
 
         except Exception as e:
-            logging.error(f"Fehler: {e}")
+            logging.error(f"Fehler im Ablauf: {e}")
             await page.screenshot(path="/config/vw_login_error_state.png")
         finally:
             await browser.close()
