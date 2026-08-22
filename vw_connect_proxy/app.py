@@ -67,7 +67,6 @@ async def handle_post(request):
     data = await request.post()
     vw_2fa_code = data.get('code', '').strip()
     
-    # Event setzen, damit das wartende Playwright-Skript weiterläuft
     code_received_event.set()
     
     return web.Response(text="Code empfangen! Du kannst dieses Fenster schließen. Schau in die Logs.", content_type='text/html')
@@ -77,7 +76,6 @@ async def start_webserver():
     app.add_routes([web.get('/', handle_get), web.post('/', handle_post)])
     runner = web.AppRunner(app)
     await runner.setup()
-    # Der Port muss mit ingress_port aus der config.yaml übereinstimmen
     site = web.TCPSite(runner, '0.0.0.0', 8099)
     await site.start()
     logging.info("Webserver für HA Ingress auf Port 8099 gestartet.")
@@ -88,13 +86,11 @@ async def handle_request(request):
     global auth_code
     url = request.url
     
-    # Sobald Chromium versucht, den App-Link zu öffnen, schlagen wir zu
     if url.startswith("weconnect://"):
         logging.info(f"App-Redirect erfolgreich gesichtet: {url}")
         parsed_url = urllib.parse.urlparse(url)
         query_params = urllib.parse.parse_qs(parsed_url.query)
         
-        # Falls der Code im Fragment steht (VW ändert das manchmal)
         if not query_params and parsed_url.fragment:
             query_params = urllib.parse.parse_qs(parsed_url.fragment)
             
@@ -102,7 +98,6 @@ async def handle_request(request):
         if code:
             logging.info("Authorization Code erfolgreich aus der URL extrahiert!")
             auth_code = code
-            # Signal an das Hauptskript senden, dass wir fertig sind
             auth_flow_finished_event.set()
 
 # --- PLAYWRIGHT AUTOMATION ---
@@ -112,7 +107,6 @@ async def run_browser_automation():
         context = await browser.new_context()
         page = await context.new_page()
 
-        # Wir nutzen den passiven Event-Listener
         page.on("request", handle_request)
 
         try:
@@ -144,6 +138,11 @@ async def run_browser_automation():
                         await asyncio.sleep(3)
                     else:
                         raise 
+
+            # Screenshot 001 im Home Assistant config-Ordner speichern
+            debug_path1 = "/config/vw_login_001.png"
+            await page.screenshot(path=debug_path1)
+            logging.info(f"Screenshot erfolgreich unter {debug_path1} gespeichert!")
 
             # Cookie Banner
             try:
@@ -178,16 +177,22 @@ async def run_browser_automation():
             except Exception as e:
                 logging.debug(f"Klick ignoriert (Navigation hat gestartet): {e}")
 
+            # Screenshot 002 fehlertolerant ablegen (falls die Seite sofort weiterleitet)
+            try:
+                debug_path2 = "/config/vw_login_002.png"
+                await page.screenshot(path=debug_path2)
+                logging.info(f"Screenshot erfolgreich unter {debug_path2} gespeichert!")
+            except Exception as e:
+                logging.debug("Screenshot 002 übersprungen (Seite hat bereits weitergeleitet)")
+
             logging.info("Prüfe auf direkten Redirect (wie im Inkognito-Test beobachtet)...")
             
-            # Wir warten 10 Sekunden. Wenn in dieser Zeit der App-Redirect erfolgt, 
-            # überspringen wir den ganzen restlichen UI-Quatsch!
+            # Wir warten 10 Sekunden auf den sofortigen App-Redirect
             try:
                 await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=10.0)
                 logging.info("Direkter Redirect erkannt! Überspringe 2FA & Zustimmungs-Screens.")
             except asyncio.TimeoutError:
-                # Nur wenn nach 10 Sekunden KEIN Redirect kam, schauen wir nach, 
-                # ob eine 2FA-Maske den Prozess blockiert.
+                # Kein sofortiger Redirect, prüfe auf 2FA
                 logging.info("Kein sofortiger Redirect. Prüfe auf 2FA-Abfrage...")
                 try:
                     if await page.locator('input[name="code"]').is_visible(timeout=3000):
@@ -207,7 +212,7 @@ async def run_browser_automation():
                             await page.locator('button[data-action-button-primary="true"]').click(timeout=3000)
                         except Exception: pass
                         
-                        # Zustimmungs-Screen nach 2FA (falls vorhanden)
+                        # Zustimmungs-Screen nach 2FA
                         try:
                             allow_btn = page.locator('button[data-action-button-primary="true"], button#allowAccess').first
                             if await allow_btn.is_visible(timeout=3000):
