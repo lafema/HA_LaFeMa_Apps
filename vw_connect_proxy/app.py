@@ -231,13 +231,23 @@ async def run_browser_automation():
 
             # 4. Token-Tausch am OIDC Token-Endpoint über sauberen API-Request
             if auth_code:
+                logging.info("Warte 3 Sekunden (Auth0 Replikations-Delay der VW-Server abwarten)...")
+                await asyncio.sleep(3)
+                
                 logging.info("Tausche Authorization Code gegen Tokens ein...")
                 
+                # Exakten User-Agent und Session-Cookies aus Playwright übernehmen
+                playwright_ua = await page.evaluate("navigator.userAgent")
+                cookies = await context.cookies()
+                session_cookies = {c['name']: c['value'] for c in cookies}
+                
                 headers = {
-                    "User-Agent": "WeConnect/3.23.1 (iOS)",
+                    "User-Agent": playwright_ua,
                     "Accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded"
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
                 }
+                
                 payload = {
                     "grant_type": "authorization_code",
                     "client_id": CLIENT_ID,
@@ -246,7 +256,7 @@ async def run_browser_automation():
                     "code_verifier": code_verifier
                 }
                 
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(cookies=session_cookies) as session:
                     async with session.post("https://identity.vwgroup.io/oidc/v1/token", data=payload, headers=headers) as token_resp:
                         if token_resp.status == 200:
                             token_data = await token_resp.json()
