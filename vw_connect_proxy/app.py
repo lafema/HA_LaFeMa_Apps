@@ -7,6 +7,7 @@ import os
 import secrets
 import urllib.parse
 import uuid
+import aiohttp
 from aiohttp import web
 from playwright.async_api import async_playwright
 
@@ -228,28 +229,33 @@ async def run_browser_automation():
                     await page.screenshot(path="/config/vw_login_timeout.png")
                     return
 
-            # 4. Token-Tausch am OIDC Token-Endpoint über Chromium Context
+            # 4. Token-Tausch am OIDC Token-Endpoint über sauberen API-Request
             if auth_code:
                 logging.info("Tausche Authorization Code gegen Tokens ein...")
-                token_resp = await context.request.post(
-                    "https://identity.vwgroup.io/oidc/v1/token",
-                    form={
-                        "grant_type": "authorization_code",
-                        "client_id": CLIENT_ID,
-                        "code": auth_code,
-                        "redirect_uri": REDIRECT_URI,
-                        "code_verifier": code_verifier
-                    }
-                )
                 
-                if token_resp.status == 200:
-                    token_data = await token_resp.json()
-                    logging.info("BINGO! Tokens erfolgreich erhalten!")
-                    with open(TOKEN_FILE, 'w') as f:
-                        json.dump(token_data, f, indent=4)
-                    logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
-                else:
-                    logging.error(f"Fehler beim Token-Tausch. HTTP {token_resp.status}: {await token_resp.text()}")
+                headers = {
+                    "User-Agent": "WeConnect/3.23.1 (iOS)",
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                }
+                payload = {
+                    "grant_type": "authorization_code",
+                    "client_id": CLIENT_ID,
+                    "code": auth_code,
+                    "redirect_uri": REDIRECT_URI,
+                    "code_verifier": code_verifier
+                }
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post("https://identity.vwgroup.io/oidc/v1/token", data=payload, headers=headers) as token_resp:
+                        if token_resp.status == 200:
+                            token_data = await token_resp.json()
+                            logging.info("BINGO! Tokens erfolgreich erhalten!")
+                            with open(TOKEN_FILE, 'w') as f:
+                                json.dump(token_data, f, indent=4)
+                            logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
+                        else:
+                            logging.error(f"Fehler beim Token-Tausch. HTTP {token_resp.status}: {await token_resp.text()}")
 
         except Exception as e:
             logging.error(f"Fehler im Ablauf: {e}")

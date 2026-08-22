@@ -1,6 +1,6 @@
 name: "VW Connect Proxy"
 description: "VW Login inkl. 2FA und extrahiert Tokens, die in der VW Connect HACS Integration hinterlegt werden."
-version: "0.0.14"
+version: "0.0.15"
 stage: experimental
 slug: "vw_connect_proxy"
 arch:
