@@ -1,10 +1,7 @@
 import asyncio
-import glob
 import json
 import logging
 import os
-import urllib.parse
-import uuid
 from aiohttp import web
 from playwright.async_api import async_playwright
 
@@ -25,7 +22,6 @@ TOKEN_FILE = '/config/.storage/vw_tokens.json'
 # Globale Events zur Steuerung des 2FA-Ablaufs
 code_received_event = asyncio.Event()
 vw_2fa_code = ""
-vw_tokens = {}
 
 # --- AIOHTTP WEBSERVER (INGRESS) ---
 async def handle_get(request):
@@ -67,62 +63,74 @@ async def start_webserver():
     await site.start()
     logging.info("Webserver für HA Ingress auf Port 8099 gestartet.")
 
-async def intercept_app_redirect(route):
-    url = route.request.url
-    if url.startswith("weconnect://"):
-        logging.info("App-Redirect abgefangen. Extrahiere Tokens...")
+# --- BACKGROUND TOKEN POLLING ---
+async def poll_token(context, client_id, device_code):
+    """Pollt den VW-Server über Chromium im Hintergrund, bis Playwright den Login beendet hat."""
+    while True:
+        await asyncio.sleep(5)
+        logging.info("Polle Token-Server im Hintergrund...")
         
-        parsed_url = urllib.parse.urlparse(url)
-        fragment_params = urllib.parse.parse_qs(parsed_url.fragment)
-        
-        if "access_token" in fragment_params and "id_token" in fragment_params:
-            global vw_tokens
-            vw_tokens = {
-                "access_token": fragment_params["access_token"][0],
-                "id_token": fragment_params["id_token"][0],
-                "refresh_token": fragment_params.get("refresh_token", [""])[0],
-                "token_type": fragment_params.get("token_type", ["Bearer"])[0]
+        # Native Chromium POST-Anfrage
+        resp = await context.request.post(
+            "https://identity.vwgroup.io/oidc/v1/token",
+            form={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": client_id,
+                "device_code": device_code
             }
-            
-            with open(TOKEN_FILE, 'w') as f:
-                json.dump(vw_tokens, f, indent=4)
-                
-            logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
-            
-            code_received_event.set() 
-            
-        await route.abort() # Verhindert, dass der Browser versucht, die unbekannte URL zu laden
-    else:
-        await route.continue_()
+        )
+        
+        if resp.status == 200:
+            data = await resp.json()
+            if "access_token" in data:
+                logging.info("Token erfolgreich vom VW-Server erhalten!")
+                with open(TOKEN_FILE, 'w') as f:
+                    json.dump(data, f, indent=4)
+                logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
+                return True
+        else:
+            try:
+                error_data = await resp.json()
+                # authorization_pending wird von VW absichtlich geschickt, solange der User sich noch einloggt
+                if error_data.get("error") != "authorization_pending":
+                    logging.warning(f"Polling Status: {error_data.get('error')}")
+            except Exception:
+                pass
 
+# --- PLAYWRIGHT AUTOMATION ---
 async def run_browser_automation():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--disable-dev-shm-usage', '--no-sandbox'])
         context = await browser.new_context()
         page = await context.new_page()
 
-        # Intercept App-Redirects, um Tokens abzufangen
-        await page.route("**/*", intercept_app_redirect)
-
         try:
-
-            # Login-Flow
-            client_id = "a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com"
+            # 1. Device Flow Variablen vorbereiten
+            # Wir nutzen exakt die DEVICE_FLOW_CLIENT_ID der WeConnect App
+            client_id = "650d46ca-2475-4384-85c2-6af3bf3d52f1@apps_vw-dilab_com"
             scope = "openid profile badge cars dealers vin offline_access"
-            redirect_uri = "weconnect://authenticated"
-            nonce = uuid.uuid4().hex
             
-            auth_url = (
-                f"https://identity.vwgroup.io/oidc/v1/authorize?"
-                f"client_id={client_id}&"
-                f"redirect_uri={redirect_uri}&"
-                f"response_type=code id_token token&"
-                f"scope={urllib.parse.quote(scope)}&"
-                f"nonce={nonce}"
+            # 2. Initiale API-Anfrage über Chromium Context
+            logging.info("Initiiere VW Device Login Flow über Chromium...")
+            resp = await context.request.post(
+                "https://identity.vwgroup.io/oidc/v1/device_authorization",
+                form={"client_id": client_id, "scope": scope}
             )
+            
+            if resp.status != 200:
+                logging.error(f"Fehler bei Device Auth. HTTP {resp.status}: {await resp.text()}")
+                return
+                
+            device_data = await resp.json()
+            device_code = device_data["device_code"]
+            verification_url = device_data["verification_uri_complete"]
 
-            logging.info("Starte nativen App-Login-Flow...")
-            await page.goto(auth_url, timeout=60000)
+            # 3. Token-Polling als Hintergrund-Task starten
+            polling_task = asyncio.create_task(poll_token(context, client_id, device_code))
+
+            # 4. Browser auf die persönliche Auth-URL leiten
+            logging.info("Navigiere zur persönlichen VW-Verifizierungsseite...")
+            await page.goto(verification_url, timeout=60000)
 
             # Screenshot im Home Assistant config-Ordner speichern
             debug_path = "/config/vw_login_001.png"
@@ -137,14 +145,20 @@ async def run_browser_automation():
                 pass
             await asyncio.sleep(2)
 
-            # Zum Login
-            await page.locator('text="Anmelden oder registrieren"').click(timeout=10000)
-            await asyncio.sleep(3)
+            # Zugangsdaten (Device-Flow landet oft direkt beim E-Mail Feld)
+            await page.fill('input[name="username"], input[name="email"]', VW_USER)
+            
+            # Manchmal ist E-Mail und Passwort im VW Flow separiert, daher Zwischenklick
+            try:
+                await page.click('button[type="submit"][name="action"]')
+                await asyncio.sleep(2)
+            except Exception:
+                pass
 
-            # Zugangsdaten
-            await page.fill('input[name="username"]', VW_USER)
+            # Passwort
             await page.fill('input[name="password"]', VW_PASSWORD)
             await page.click('button[type="submit"][name="action"]')
+            await asyncio.sleep(3)
 
             # Prüfen, ob 2FA verlangt wird
             try:
@@ -161,69 +175,47 @@ async def run_browser_automation():
                     
                     # Checkbox anklicken (30 Tage speichern)
                     logging.info("Setze Haken bei 'Dieses Gerät 30 Tage speichern'...")
-                    await page.locator('label[for="rememberBrowser"]').click()
+                    try:
+                        await page.locator('label[for="rememberBrowser"]').click()
+                    except Exception:
+                        pass
                     
                     # Button zum Fortfahren klicken
                     logging.info("Klicke auf Fortfahren...")
                     await page.locator('button[data-action-button-primary="true"]').click()
-
+                    await asyncio.sleep(4)
             except asyncio.TimeoutError:
                 logging.error("Kein Code über die Web-UI eingegangen (Timeout nach 5 Minuten).")
                 return
             except Exception:
                 pass # Keine 2FA Maske, normal weiter
 
-            # Auf Weiterleitung warten und bei Timeout einen Screenshot machen
+            # Der finale "Zulassen" / "Allow" Screen (OAuth Consent)
+            logging.info("Prüfe auf App-Autorisierungs-Screen...")
             try:
-                logging.info("Warte auf finale Weiterleitung ins Portal...")
-            
-                await page.wait_for_url("**/*featureAppSection*", timeout=30000)
-                logging.info("Dashboard erfolgreich erreicht! Login abgeschlossen.")
+                allow_btn = page.locator('button[data-action-button-primary="true"], button#allowAccess').first
+                if await allow_btn.is_visible(timeout=5000):
+                    logging.info("Klicke auf 'Zulassen'...")
+                    await allow_btn.click()
+            except Exception: 
+                pass
 
-                # Cookie-Datei der HACS-Integration dynamisch suchen
-                storage_dir = "/config/.storage"
-
-                # Sucht nach der Datei mit dem Hash im Namen
-                cookie_files = glob.glob(os.path.join(storage_dir, "volkswagencarnet_auth_*.json"))
+            # Warten, bis der Polling-Task im Hintergrund den Token gemeldet hat
+            logging.info("Warte auf Abschluss des API-Hintergrund-Pollings...")
+            try:
+                await asyncio.wait_for(polling_task, timeout=45.0)
+                logging.info("Skript beendet. Tokens liegen im Config-Ordner bereit!")
                 
-                if cookie_files:
-                    original_file = cookie_files[0]
-                    directory, filename = os.path.split(original_file)
-                    
-                    # "test_" Präfix hinzufügen
-                    test_cookie_file = os.path.join(directory, f"test_{filename}")
-                    logging.info(f"Speichere Test-Cookies in: {test_cookie_file}")
-                    
-                    # Alle Session-Cookies aus Playwright ziehen
-                    cookies = await context.cookies()
-                    
-                    # Cookies in die Test-Datei schreiben
-                    with open(test_cookie_file, 'w') as f:
-                        json.dump(cookies, f, indent=4)
-                        
-                    logging.info("Playwright-Cookies erfolgreich an die HACS-Integration übergeben.")
-                else:
-                    logging.error("FEHLER: Keine volkswagencarnet_auth_*.json in /config/.storage/ gefunden!")
-                
-                # Kurz warten
-                await asyncio.sleep(5)
-                
-            except Exception as e:
-                logging.warning("Timeout beim Warten auf '/portal/'. Erstelle Debug-Screenshot...")
-                
-                # Aktuelle URL ins Log schreiben (oft verrät das schon das Problem)
+                # Wir geben der JSON-Speicherung noch eine Sekunde Sicherheit
+                await asyncio.sleep(1)
+            except asyncio.TimeoutError:
+                logging.warning("Timeout beim Warten auf Tokens vom VW-Server. Erstelle Debug-Screenshot...")
+                await page.screenshot(path="/config/vw_login_timeout.png")
                 logging.info(f"Die aktuelle URL im Browser ist: {page.url}")
-                
-                # Screenshot im Home Assistant config-Ordner speichern
-                debug_path = "/config/vw_login_timeout.png"
-                await page.screenshot(path=debug_path)
-                logging.info(f"Screenshot erfolgreich unter {debug_path} gespeichert!")
-                
-                # Wir lassen ihn trotzdem noch kurz warten, falls noch Netzwerk-Requests für die Tokens laufen
-                await asyncio.sleep(10)
 
         except Exception as e:
             logging.error(f"Fehler: {e}")
+            await page.screenshot(path="/config/vw_login_error_state.png")
         finally:
             await browser.close()
 
