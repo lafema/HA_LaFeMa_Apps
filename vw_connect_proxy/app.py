@@ -1,7 +1,12 @@
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
+import secrets
+import urllib.parse
+import uuid
 from aiohttp import web
 from playwright.async_api import async_playwright
 
@@ -19,9 +24,23 @@ except FileNotFoundError:
 
 TOKEN_FILE = '/config/.storage/vw_tokens.json'
 
+CLIENT_ID = "a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com"
+REDIRECT_URI = "weconnect://authenticated"
+SCOPE = "openid profile badge cars dealers vin offline_access"
+
 # Globale Events zur Steuerung des 2FA-Ablaufs
 code_received_event = asyncio.Event()
+auth_flow_finished_event = asyncio.Event()
 vw_2fa_code = ""
+auth_code = ""
+
+# --- PKCE HELPER ---
+def generate_pkce_pair():
+    """Generiert code_verifier und code_challenge für PKCE."""
+    code_verifier = secrets.token_urlsafe(64)
+    hashed = hashlib.sha256(code_verifier.encode('ascii')).digest()
+    code_challenge = base64.urlsafe_b64encode(hashed).decode('ascii').rstrip('=')
+    return code_verifier, code_challenge
 
 # --- AIOHTTP WEBSERVER (INGRESS) ---
 async def handle_get(request):
@@ -63,39 +82,29 @@ async def start_webserver():
     await site.start()
     logging.info("Webserver für HA Ingress auf Port 8099 gestartet.")
 
-# --- BACKGROUND TOKEN POLLING ---
-async def poll_token(context, client_id, device_code):
-    """Pollt den VW-Server über Chromium im Hintergrund, bis Playwright den Login beendet hat."""
-    while True:
-        await asyncio.sleep(5)
-        logging.info("Polle Token-Server im Hintergrund...")
+# --- PLAYWRIGHT ROUTE INTERCEPTOR ---
+async def intercept_weconnect_redirect(route):
+    """Fängt die weconnect:// Weiterleitung ab und extrahiert den Auth Code."""
+    global auth_code
+    url = route.request.url
+    if url.startswith("weconnect://"):
+        logging.info(f"App-Redirect abgefangen: {url}")
+        parsed_url = urllib.parse.urlparse(url)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
         
-        # Native Chromium POST-Anfrage
-        resp = await context.request.post(
-            "https://identity.vwgroup.io/oidc/v1/token",
-            form={
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "client_id": client_id,
-                "device_code": device_code
-            }
-        )
-        
-        if resp.status == 200:
-            data = await resp.json()
-            if "access_token" in data:
-                logging.info("Token erfolgreich vom VW-Server erhalten!")
-                with open(TOKEN_FILE, 'w') as f:
-                    json.dump(data, f, indent=4)
-                logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
-                return True
-        else:
-            try:
-                error_data = await resp.json()
-                # authorization_pending wird von VW absichtlich geschickt, solange der User sich noch einloggt
-                if error_data.get("error") != "authorization_pending":
-                    logging.warning(f"Polling Status: {error_data.get('error')}")
-            except Exception:
-                pass
+        # Manchmal hängt der Code auch im Fragment
+        if not query_params and parsed_url.fragment:
+            query_params = urllib.parse.parse_qs(parsed_url.fragment)
+            
+        code = query_params.get("code", [None])[0]
+        if code:
+            logging.info("Authorization Code erfolgreich abgefangen!")
+            auth_code = code
+            auth_flow_finished_event.set()
+            
+        await route.abort()
+    else:
+        await route.continue_()
 
 # --- PLAYWRIGHT AUTOMATION ---
 async def run_browser_automation():
@@ -104,33 +113,28 @@ async def run_browser_automation():
         context = await browser.new_context()
         page = await context.new_page()
 
+        # Route Interceptor aktivieren
+        await page.route("**/*", intercept_weconnect_redirect)
+
         try:
-            # 1. Device Flow Variablen vorbereiten
-            # Wir nutzen exakt die DEVICE_FLOW_CLIENT_ID der WeConnect App
-            client_id = "650d46ca-2475-4384-85c2-6af3bf3d52f1@apps_vw-dilab_com"
-            scope = "openid profile badge cars dealers vin offline_access"
+            # 1. PKCE Parameter generieren
+            code_verifier, code_challenge = generate_pkce_pair()
+            nonce = uuid.uuid4().hex
             
-            # 2. Initiale API-Anfrage über Chromium Context
-            logging.info("Initiiere VW Device Login Flow über Chromium...")
-            resp = await context.request.post(
-                "https://identity.vwgroup.io/oidc/v1/device_authorization",
-                form={"client_id": client_id, "scope": scope}
-            )
-            
-            if resp.status != 200:
-                logging.error(f"Fehler bei Device Auth. HTTP {resp.status}: {await resp.text()}")
-                return
-                
-            device_data = await resp.json()
-            device_code = device_data["device_code"]
-            verification_url = device_data["verification_uri_complete"]
+            # 2. Reinen Authorization Code Flow initiieren (ohne implicit 'token')
+            auth_params = {
+                "client_id": CLIENT_ID,
+                "redirect_uri": REDIRECT_URI,
+                "response_type": "code",
+                "scope": SCOPE,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "nonce": nonce
+            }
+            auth_url = f"https://identity.vwgroup.io/oidc/v1/authorize?{urllib.parse.urlencode(auth_params)}"
 
-            # 3. Token-Polling als Hintergrund-Task starten
-            polling_task = asyncio.create_task(poll_token(context, client_id, device_code))
-
-            # 4. Browser auf die persönliche Auth-URL leiten
-            logging.info("Navigiere zur persönlichen VW-Verifizierungsseite...")
-            await page.goto(verification_url, timeout=60000)
+            logging.info("Starte Authorization-Code Flow über Playwright...")
+            await page.goto(auth_url, timeout=60000)
 
             # Screenshot im Home Assistant config-Ordner speichern
             debug_path = "/config/vw_login_001.png"
@@ -145,10 +149,9 @@ async def run_browser_automation():
                 pass
             await asyncio.sleep(2)
 
-            # Zugangsdaten (Device-Flow landet oft direkt beim E-Mail Feld)
+            # Zugangsdaten
             await page.fill('input[name="username"], input[name="email"]', VW_USER)
             
-            # Manchmal ist E-Mail und Passwort im VW Flow separiert, daher Zwischenklick
             try:
                 await page.click('button[type="submit"][name="action"]')
                 await asyncio.sleep(2)
@@ -165,53 +168,60 @@ async def run_browser_automation():
                 if await page.locator('input[name="code"]').is_visible(timeout=5000):
                     logging.info("!!! VW verlangt 2FA. Bitte öffne die Web UI des Add-ons in Home Assistant und trage den Code ein !!!")
                     
-                    # Warten, bis der Code über die Web-UI eingereicht wurde
                     code_received_event.clear()
-                    await asyncio.wait_for(code_received_event.wait(), timeout=300) # 5 Minuten Timeout
+                    await asyncio.wait_for(code_received_event.wait(), timeout=300)
                     
-                    # Code eingeben
                     logging.info(f"Gebe empfangenen Code ein: {vw_2fa_code}")
                     await page.fill('input[name="code"]', vw_2fa_code)
                     
-                    # Checkbox anklicken (30 Tage speichern)
-                    logging.info("Setze Haken bei 'Dieses Gerät 30 Tage speichern'...")
                     try:
                         await page.locator('label[for="rememberBrowser"]').click()
                     except Exception:
                         pass
                     
-                    # Button zum Fortfahren klicken
-                    logging.info("Klicke auf Fortfahren...")
                     await page.locator('button[data-action-button-primary="true"]').click()
                     await asyncio.sleep(4)
             except asyncio.TimeoutError:
                 logging.error("Kein Code über die Web-UI eingegangen (Timeout nach 5 Minuten).")
                 return
             except Exception:
-                pass # Keine 2FA Maske, normal weiter
+                pass
 
-            # Der finale "Zulassen" / "Allow" Screen (OAuth Consent)
-            logging.info("Prüfe auf App-Autorisierungs-Screen...")
+            # Finaler Zustimmungsbildschirm ("Zulassen"), falls vorhanden
             try:
                 allow_btn = page.locator('button[data-action-button-primary="true"], button#allowAccess').first
                 if await allow_btn.is_visible(timeout=5000):
                     logging.info("Klicke auf 'Zulassen'...")
                     await allow_btn.click()
-            except Exception: 
+            except Exception:
                 pass
 
-            # Warten, bis der Polling-Task im Hintergrund den Token gemeldet hat
-            logging.info("Warte auf Abschluss des API-Hintergrund-Pollings...")
-            try:
-                await asyncio.wait_for(polling_task, timeout=45.0)
-                logging.info("Skript beendet. Tokens liegen im Config-Ordner bereit!")
+            # 3. Warten, bis der Redirect weconnect:// abgefangen wurde
+            logging.info("Warte auf App-Weiterleitung...")
+            await asyncio.wait_for(auth_flow_finished_event.wait(), timeout=45.0)
+
+            # 4. Token-Tausch am OIDC Token-Endpoint über Chromium Context
+            if auth_code:
+                logging.info("Tausche Authorization Code gegen Tokens ein...")
+                token_resp = await context.request.post(
+                    "https://identity.vwgroup.io/oidc/v1/token",
+                    form={
+                        "grant_type": "authorization_code",
+                        "client_id": CLIENT_ID,
+                        "code": auth_code,
+                        "redirect_uri": REDIRECT_URI,
+                        "code_verifier": code_verifier
+                    }
+                )
                 
-                # Wir geben der JSON-Speicherung noch eine Sekunde Sicherheit
-                await asyncio.sleep(1)
-            except asyncio.TimeoutError:
-                logging.warning("Timeout beim Warten auf Tokens vom VW-Server. Erstelle Debug-Screenshot...")
-                await page.screenshot(path="/config/vw_login_timeout.png")
-                logging.info(f"Die aktuelle URL im Browser ist: {page.url}")
+                if token_resp.status == 200:
+                    token_data = await token_resp.json()
+                    logging.info("BINGO! Tokens erfolgreich erhalten!")
+                    with open(TOKEN_FILE, 'w') as f:
+                        json.dump(token_data, f, indent=4)
+                    logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
+                else:
+                    logging.error(f"Fehler beim Token-Tausch. HTTP {token_resp.status}: {await token_resp.text()}")
 
         except Exception as e:
             logging.error(f"Fehler: {e}")
@@ -220,7 +230,6 @@ async def run_browser_automation():
             await browser.close()
 
 async def main():
-    # Startet Webserver und Playwright gleichzeitig
     await asyncio.gather(
         start_webserver(),
         run_browser_automation()
