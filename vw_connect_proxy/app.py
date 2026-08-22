@@ -3,6 +3,8 @@ import glob
 import json
 import logging
 import os
+import urllib.parse
+import uuid
 from aiohttp import web
 from playwright.async_api import async_playwright
 
@@ -65,15 +67,64 @@ async def start_webserver():
     await site.start()
     logging.info("Webserver für HA Ingress auf Port 8099 gestartet.")
 
+async def intercept_app_redirect(route):
+    url = route.request.url
+    if url.startswith("weconnect://"):
+        logging.info("App-Redirect abgefangen. Extrahiere Tokens...")
+        
+        parsed_url = urllib.parse.urlparse(url)
+        fragment_params = urllib.parse.parse_qs(parsed_url.fragment)
+        
+        if "access_token" in fragment_params and "id_token" in fragment_params:
+            global vw_tokens
+            vw_tokens = {
+                "access_token": fragment_params["access_token"][0],
+                "id_token": fragment_params["id_token"][0],
+                "refresh_token": fragment_params.get("refresh_token", [""])[0],
+                "token_type": fragment_params.get("token_type", ["Bearer"])[0]
+            }
+            
+            with open(TOKEN_FILE, 'w') as f:
+                json.dump(vw_tokens, f, indent=4)
+                
+            logging.info(f"Tokens erfolgreich für die HACS-Integration in {TOKEN_FILE} gespeichert!")
+            
+            code_received_event.set() 
+            
+        await route.abort() # Verhindert, dass der Browser versucht, die unbekannte URL zu laden
+    else:
+        await route.continue_()
+
 async def run_browser_automation():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--disable-dev-shm-usage', '--no-sandbox'])
         context = await browser.new_context()
         page = await context.new_page()
 
+        # Intercept App-Redirects, um Tokens abzufangen
+        await page.route("**/*", intercept_app_redirect)
+
         try:
-            logging.info("Navigiere zur VW-Anmeldeseite...")
-            await page.goto("https://identity.vwgroup.io/v2/login/ui/sign-up?client_id=@apps_vw-dilab_com&lee=VOLKSWAGEN&theme=volkswagen", timeout=60000)
+
+            # Login-Flow
+            client_id = "a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com"
+            scope = "openid profile badge cars dealers vin offline_access"
+            redirect_uri = "weconnect://authenticated"
+            nonce = uuid.uuid4().hex
+            
+            auth_url = (
+                f"https://identity.vwgroup.io/oidc/v1/authorize?"
+                f"client_id={client_id}&"
+                f"redirect_uri={redirect_uri}&"
+                f"response_type=code id_token token&"
+                f"scope={urllib.parse.quote(scope)}&"
+                f"nonce={nonce}"
+            )
+
+            logging.info("Starte nativen App-Login-Flow...")
+            await page.goto(auth_url, timeout=60000)
+
+            await page.screenshot("/config/vw_login_001.png")
 
             # Cookie Banner
             try:
