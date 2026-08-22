@@ -150,18 +150,31 @@ async def run_browser_automation():
             await asyncio.sleep(2)
 
             # Zugangsdaten
+            logging.info("Gebe E-Mail ein...")
             await page.fill('input[name="username"], input[name="email"]', VW_USER)
             
-            try:
-                await page.click('button[type="submit"][name="action"]')
-                await asyncio.sleep(2)
-            except Exception:
-                pass
+            # Prüfen, ob das Passwort-Feld schon sichtbar ist - Wenn NICHT, auf "Weiter" klicken
+            if not await page.locator('input[name="password"]').is_visible():
+                logging.info("Passwort-Feld nicht sichtbar, klicke auf Weiter...")
+                await page.click('button[type="submit"], button#email-submit, button[data-action-button-primary="true"]')
+                await page.locator('input[name="password"]').wait_for(timeout=5000)
 
             # Passwort
+            logging.info("Gebe Passwort ein...")
             await page.fill('input[name="password"]', VW_PASSWORD)
-            await page.click('button[type="submit"][name="action"]')
-            await asyncio.sleep(3)
+            
+            # Formular absenden
+            logging.info("Sende Formular ab...")
+            # Methode 1: "Enter"-Taste im Passwort-Feld
+            await page.press('input[name="password"]', 'Enter')
+            
+            # Methode 2: Fallback-Klick, falls Enter ignoriert wird
+            try:
+                await page.click('button[type="submit"], button[data-action-button-primary="true"]', timeout=3000)
+            except Exception:
+                pass # Wenn Enter schon funktioniert hat, ist der Button evtl. schon weg
+                
+            await asyncio.sleep(4)
 
             # Screenshot 002 im Home Assistant config-Ordner speichern
             debug_path = "/config/vw_login_002.png"
