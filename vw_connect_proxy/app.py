@@ -161,29 +161,30 @@ async def run_browser_automation():
 
             # Zugangsdaten
             logging.info("Gebe E-Mail ein...")
-            await page.fill('input[name="username"], input[name="email"]', VW_USER)
+            # Wir nutzen generische Typen und IDs, die in jedem Auth0-Theme gleich sind
+            await page.fill('input[type="email"], input[name="email"], input[name="username"]', VW_USER)
             
-            # Prüfen, ob das Passwort-Feld schon sichtbar ist - Wenn NICHT, auf "Weiter" klicken
-            if not await page.locator('input[name="password"]').is_visible():
-                logging.info("Passwort-Feld nicht sichtbar, klicke auf Weiter...")
-                await page.click('button[type="submit"], button#email-submit, button[data-action-button-primary="true"]')
-                await page.locator('input[name="password"]').wait_for(timeout=5000)
+            # Prüfen, ob das Passwort-Feld schon sichtbar ist
+            if not await page.locator('input[type="password"]').is_visible():
+                logging.info("Passwort-Feld nicht direkt sichtbar, klicke auf Weiter...")
+                # Suchen nach Text, der auf den Weiter-Button passt
+                await page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first.click()
+                await page.locator('input[type="password"]').wait_for(timeout=5000)
 
             # Passwort
             logging.info("Gebe Passwort ein...")
-            await page.fill('input[name="password"]', VW_PASSWORD)
+            await page.fill('input[type="password"]', VW_PASSWORD)
             
-            # Formular absenden
-            logging.info("Sende Formular ab...")
-            # Methode 1: "Enter"-Taste im Passwort-Feld
-            await page.press('input[name="password"]', 'Enter')
+            # Javascript-Validierung triggern: Fokus vom Passwort-Feld nehmen
+            await page.keyboard.press('Tab')
+            await asyncio.sleep(1)
             
-            # Methode 2: Fallback-Klick, falls Enter ignoriert wird
-            try:
-                await page.click('button[type="submit"], button[data-action-button-primary="true"]', timeout=3000)
-            except Exception:
-                pass # Wenn Enter schon funktioniert hat, ist der Button evtl. schon weg
-                
+            # Formular explizit über den Text-Button absenden
+            logging.info("Sende Login-Formular ab...")
+            submit_btn = page.locator('button:has-text("Continue"), button:has-text("Weiter"), button:has-text("Fortfahren"), button[type="submit"]').first
+            await submit_btn.click()
+            
+            # Dem Server Zeit zum Verarbeiten geben
             await asyncio.sleep(4)
 
             # Screenshot 002 im Home Assistant config-Ordner speichern
