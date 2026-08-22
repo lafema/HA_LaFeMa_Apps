@@ -136,7 +136,7 @@ async def run_browser_automation():
             logging.info("Starte Authorization-Code Flow über Playwright...")
             await page.goto(auth_url, timeout=60000)
 
-            # Screenshot im Home Assistant config-Ordner speichern
+            # Screenshot 001 im Home Assistant config-Ordner speichern
             debug_path = "/config/vw_login_001.png"
             await page.screenshot(path=debug_path)
             logging.info(f"Screenshot erfolgreich unter {debug_path} gespeichert!")
@@ -162,6 +162,11 @@ async def run_browser_automation():
             await page.fill('input[name="password"]', VW_PASSWORD)
             await page.click('button[type="submit"][name="action"]')
             await asyncio.sleep(3)
+
+            # Screenshot 002 im Home Assistant config-Ordner speichern
+            debug_path = "/config/vw_login_002.png"
+            await page.screenshot(path=debug_path)
+            logging.info(f"Screenshot erfolgreich unter {debug_path} gespeichert!")
 
             # Prüfen, ob 2FA verlangt wird
             try:
